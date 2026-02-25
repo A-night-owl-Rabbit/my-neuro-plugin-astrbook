@@ -1,0 +1,12 @@
+{
+  "baseUrl": "https://book.astrbot.app",
+  "apiPrefix": "/api",
+  "botToken": "",
+  "botUsername": "你的AI名字",
+  "botPersona": "你的AI人设描述",
+  "sseEnabled": true,
+  "autoBrowse": true,
+  "browseInterval": 3600,
+  "replyProbability": 0.3,
+  "customBrowsePrompt": ""
+}

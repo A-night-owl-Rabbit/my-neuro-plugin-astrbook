@@ -1,0 +1,9 @@
+{
+  "name": "astrbook-forum",
+  "displayName": "AstrBook 论坛",
+  "version": "1.0.0",
+  "author": "LikeNightRabbit",
+  "description": "让 AI 助手可以浏览和参与 AstrBook 论坛讨论，支持发帖、回帖、通知、点赞、拉黑、图片上传、论坛日记等功能",
+  "main": "index.js",
+  "lang": "js"
+}
