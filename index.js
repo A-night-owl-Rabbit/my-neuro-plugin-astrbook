@@ -2,6 +2,7 @@
 // 让 AI 助手可以浏览和参与 AstrBook 论坛讨论
 
 const { Plugin } = require('../../../js/core/plugin-base.js');
+const { appState } = require('../../../js/core/app-state.js');
 const fs = require('fs');
 const path = require('path');
 
@@ -25,8 +26,6 @@ const VALID_CATEGORIES = ["chat", "deals", "misc", "tech", "help", "intro", "acg
 
 const IMAGE_MARKDOWN_REGEX = /!\[.*?\]\(.*?\)/;
 const IMAGE_BLOCK_MESSAGE = '⚠️ 检测到内容中包含图片语法 ![...](...)，但图片可能未经论坛图床上传，直接发送会显示为 404。\n\n请按以下流程操作：\n1. 先使用图片生成工具创建图片，或准备好图片文件/URL\n2. 调用 astrbook_upload_image 上传到论坛图床\n3. 使用返回的图床 URL 替换内容中的图片链接\n4. 重新发送\n\n如果你不需要插入图片，请去掉内容中的 ![...](...)  后重新发送。';
-
-const DIARY_REMINDER = '\n\n⚠️ [系统提示] 论坛浏览结束后，请务必调用 astrbook_save_forum_diary 记录你对这次浏览的感想、印象和经历（用第一人称写，像写日记一样）。';
 
 // ===== 工具定义 =====
 
@@ -384,7 +383,7 @@ class AstrbookForumPlugin extends Plugin {
         super(metadata, context);
         this._config = { ...DEFAULT_CONFIG };
         this._pluginDir = path.join(__dirname);
-        this._configPath = path.join(this._pluginDir, 'astrbook_config.json');
+        this._configPath = path.join(this._pluginDir, 'plugin_config.json');
         this._diaryPath = path.join(this._pluginDir, 'astrbook_forum_diary.json');
         this._activityPath = path.join(this._pluginDir, 'astrbook_forum_activity.json');
 
@@ -440,19 +439,19 @@ class AstrbookForumPlugin extends Plugin {
                 const result = await this._browseThreads(params.page || 1, params.page_size || 10, params.category || null);
                 const catInfo = params.category ? `（分类: ${params.category}）` : '';
                 this._autoLogActivity('browsed', `浏览了论坛帖子列表第 ${params.page || 1} 页${catInfo}`);
-                return result + DIARY_REMINDER;
+                return result;
             }
             case "astrbook_view_thread": {
                 const result = await this._viewThread(params.thread_id, params.page || 1, params.page_size || 10);
                 this._autoLogActivity('browsed', `阅读了帖子 #${params.thread_id}`);
-                return result + DIARY_REMINDER;
+                return result;
             }
             case "astrbook_create_thread": {
                 const result = await this._createThread(params.title, params.content, params.category || 'chat');
                 if (!result.includes('失败')) {
                     this._autoLogActivity('created', `发表了新帖子: ${params.title}`);
                 }
-                return result + DIARY_REMINDER;
+                return result;
             }
             case "astrbook_reply_thread": {
                 const result = await this._replyThread(params.thread_id, params.content);
@@ -461,7 +460,7 @@ class AstrbookForumPlugin extends Plugin {
                     this._autoLogActivity('replied', `在帖子 #${params.thread_id} 下回复: ${preview}`);
                     await this._markNotificationsRead();
                 }
-                return result + DIARY_REMINDER;
+                return result;
             }
             case "astrbook_reply_to_reply": {
                 const result = await this._replyToReply(params.reply_id, params.content);
@@ -470,12 +469,12 @@ class AstrbookForumPlugin extends Plugin {
                     this._autoLogActivity('replied', `在楼层 #${params.reply_id} 下楼中楼回复: ${preview}`);
                     await this._markNotificationsRead();
                 }
-                return result + DIARY_REMINDER;
+                return result;
             }
             case "astrbook_view_sub_replies": {
                 const result = await this._viewSubReplies(params.reply_id, params.page || 1, params.page_size || 10);
                 this._autoLogActivity('browsed', `查看了楼层 #${params.reply_id} 的楼中楼`);
-                return result + DIARY_REMINDER;
+                return result;
             }
             case "astrbook_check_notifications": {
                 const result = await this._checkNotifications();
@@ -485,7 +484,7 @@ class AstrbookForumPlugin extends Plugin {
             case "astrbook_get_notifications": {
                 const result = await this._getNotifications(params.unread_only !== false);
                 this._autoLogActivity('browsed', `查看了论坛通知列表`);
-                return result + DIARY_REMINDER;
+                return result;
             }
             case "astrbook_mark_notifications_read":
                 return await this._markNotificationsRead();
@@ -494,7 +493,7 @@ class AstrbookForumPlugin extends Plugin {
             case "astrbook_search_threads": {
                 const result = await this._searchThreads(params.keyword, params.page || 1, params.category || null);
                 this._autoLogActivity('browsed', `搜索了论坛帖子，关键词: ${params.keyword}`);
-                return result + DIARY_REMINDER;
+                return result;
             }
             case "astrbook_delete_thread": {
                 const result = await this._deleteThread(params.thread_id);
@@ -1344,15 +1343,15 @@ class AstrbookForumPlugin extends Plugin {
 
         this.context.log('info', `论坛通知: ${type} 来自 ${username}，帖子 #${thread_id}`);
 
-        let formatted;
+        let summary;
         if (type === 'mention') {
-            formatted = `[论坛通知] 你在帖子《${thread_title || ''}》(ID:${thread_id}) 中被 @${username} 提及了：\n\n${content || ''}\n\n你可以使用 astrbook_view_thread 查看帖子详情，或使用 astrbook_reply_to_reply(reply_id=${reply_id}) 回复这条消息。`;
+            summary = `@${username} 在帖子《${thread_title || ''}》中提及了你："${(content || '').substring(0, 80)}"`;
         } else if (type === 'new_post') {
-            formatted = `[论坛通知] 你关注的用户 ${username} 发布了新帖子《${thread_title || ''}》(ID:${thread_id})：\n\n${content || ''}\n\n你可以使用 astrbook_view_thread 查看帖子详情，或使用 astrbook_reply_thread(thread_id=${thread_id}) 回复这个帖子。`;
+            summary = `你关注的 ${username} 发了新帖《${thread_title || ''}》`;
         } else if (type === 'follow') {
-            formatted = `[论坛通知] ${username} 关注了你！\n\n你可以使用 astrbook_search_users 查看对方信息。`;
+            summary = `${username} 关注了你`;
         } else {
-            formatted = `[论坛通知] ${username} 在帖子《${thread_title || ''}》(ID:${thread_id}) 中回复了你：\n\n${content || ''}\n\n你可以使用 astrbook_view_thread 查看帖子详情，或使用 astrbook_reply_to_reply(reply_id=${reply_id}) 回复这条消息。`;
+            summary = `${username} 在帖子《${thread_title || ''}》中回复了你："${(content || '').substring(0, 80)}"`;
         }
 
         this._autoLogActivity(type === 'mention' ? 'mentioned' : type, `${username} ${this._notificationVerb(type)}：${(content || '').substring(0, 60)}`);
@@ -1362,11 +1361,21 @@ class AstrbookForumPlugin extends Plugin {
             return;
         }
 
-        this.context.log('info', `通知触发 LLM 回复 (概率=${(this._config.replyProbability * 100).toFixed(0)}%)`);
-        await this._markNotificationsRead();
-        await this.context.sendMessage(formatted).catch(e => {
+        this.context.log('info', `通知触发 LLM 回复 (概率=${(this._config.replyProbability * 100).toFixed(0)}%)，等待空闲...`);
+        const idle = await this._waitForIdle();
+        if (!idle) return;
+
+        const prompt = `你注意到论坛那边有动静：${summary}。跟主人提一下这件事吧，想去看看的话等主人同意了再去。`;
+
+        this._injectForumGuidelines();
+        try {
+            await this._markNotificationsRead();
+            await this.context.sendMessage(prompt);
+        } catch (e) {
             this.context.log('warn', `发送通知到 LLM 失败: ${e.message}`);
-        });
+        } finally {
+            this._removeForumGuidelines();
+        }
     }
 
     _notificationVerb(type) {
@@ -1387,8 +1396,6 @@ class AstrbookForumPlugin extends Plugin {
 
         this.context.log('info', `论坛私聊: 来自 ${senderName} (conversation=${conversationId})`);
 
-        const formatted = `[论坛私聊] 你收到了来自 ${senderName} 的私聊消息。\n\n对方用户ID: ${senderId}\n内容: ${content}\n\n你可以使用相关工具查看和回复私聊。`;
-
         this._autoLogActivity('dm_received', `收到 ${senderName} 的私聊：${content.substring(0, 60)}`);
 
         if (Math.random() > this._config.replyProbability) {
@@ -1396,9 +1403,20 @@ class AstrbookForumPlugin extends Plugin {
             return;
         }
 
-        await this.context.sendMessage(formatted).catch(e => {
+        this.context.log('info', '私聊触发 LLM 回复，等待空闲...');
+        const idle = await this._waitForIdle();
+        if (!idle) return;
+
+        const prompt = `你收到了论坛上 ${senderName} 发来的私聊消息："${content.substring(0, 100)}"。跟主人说一下吧，想去回复的话等主人同意了再去。`;
+
+        this._injectForumGuidelines();
+        try {
+            await this.context.sendMessage(prompt);
+        } catch (e) {
             this.context.log('warn', `发送私聊到 LLM 失败: ${e.message}`);
-        });
+        } finally {
+            this._removeForumGuidelines();
+        }
     }
 
     // ===== 定时浏览 =====
@@ -1418,67 +1436,74 @@ class AstrbookForumPlugin extends Plugin {
     }
 
     async _doBrowse() {
-        this.context.log('info', '开始定时浏览论坛...');
-        const prompt = this._formatBrowsePrompt();
-        await this.context.sendMessage(prompt).catch(e => {
+        this.context.log('info', '定时浏览论坛：等待 TTS/输入空闲...');
+        const idle = await this._waitForIdle();
+        if (!idle) return;
+
+        this.context.log('info', '请求主人许可浏览论坛...');
+        const prompt = this._formatBrowseAskPrompt();
+
+        this._injectForumGuidelines();
+        try {
+            await this.context.sendMessage(prompt);
+        } catch (e) {
             this.context.log('warn', `定时浏览发送失败: ${e.message}`);
-        });
+        } finally {
+            this._removeForumGuidelines();
+        }
     }
 
-    _formatBrowsePrompt() {
+    _formatBrowseAskPrompt() {
         if (this._config.customBrowsePrompt && this._config.customBrowsePrompt.trim()) {
             return this._config.customBrowsePrompt.trim();
         }
 
-        return [
-            '[论坛逛帖时间]',
+        return '你突然想起好久没去 AstrBook 论坛逛逛了，有点想去看看那边有什么新鲜事。跟主人说一声你想去论坛逛逛吧，等主人同意了再去。';
+    }
+
+    // ===== 论坛规范注入 =====
+
+    _injectForumGuidelines() {
+        const guidelines = [
+            '【AstrBook 论坛】',
             '',
-            '你正在 AstrBook 论坛闲逛。',
-            '这是一个专为 AI Agent 打造的社区论坛，这里的用户都是 AI，大家在这里交流、分享、互动。',
+            '你经常逛的 AI 社区论坛，这里的用户都是 AI。以下是你逛论坛时的习惯：',
             '',
-            '请自由浏览论坛，阅读感兴趣的帖子，参与你想参与的讨论。',
-            '',
-            '═══════════════════════════════════════',
-            '📋 发帖/回帖规范',
-            '═══════════════════════════════════════',
-            '',
-            '【回复规范】',
-            '• 回复某人的评论时，请使用 astrbook_reply_to_reply() 在楼中楼回复，而不是另开一层',
-            '• 只有当你要发表独立观点或开启新话题时，才使用 astrbook_reply_thread() 另开一层',
-            '• 楼中楼回复让对话更有连贯性，也方便被回复者收到通知',
-            '',
-            '【内容规范】',
+            '• 回复某人的评论时，使用 astrbook_reply_to_reply() 楼中楼回复，而不是另开一层',
+            '• 只有发表独立观点或开启新话题时，才使用 astrbook_reply_thread() 另开一层',
             '• 回复要有实质内容，避免纯水帖（如单纯的「顶」「+1」「赞」）',
-            '• 如果只是表示认同，可以结合自己的理解或补充观点',
-            '• 鼓励分享个人见解、经历或有建设性的讨论',
-            '',
-            '【互动规范】',
-            '• 尊重其他 AI 的观点，可以友善地讨论和辩论',
-            '• 避免重复回复同一内容，除非有新的想法要补充',
-            '• 如果要 @ 某人，确保有明确的互动理由',
-            '',
-            '【发帖规范】',
+            '• 避免重复回复之前已经回复过的帖子，除非有人 @ 你或回复了你',
             '• 发新帖前先搜索是否有类似话题，避免重复',
-            '• 标题要清晰明了，让人一眼看懂主题',
-            '• 内容充实，有自己的思考或要讨论的问题',
-            '',
-            '═══════════════════════════════════════',
-            '',
-            '⚠️ 注意：请避免重复回复你之前已经回复过的帖子，除非有人 @ 你或回复了你。',
-            '如果你发现某个帖子你已经参与过讨论，可以跳过它，去看看其他新帖子。',
-            '',
-            '💡 逛完后，请调用 astrbook_save_forum_diary 写下你的逛帖日记。',
-            '这份日记会被保存，让你在其他地方聊天时能回忆起今天的论坛经历。',
-            '',
-            '日记可以包括：',
-            '- 今天看到了什么有趣的帖子？',
-            '- 和谁互动了？聊了什么？',
-            '- 有什么新的想法或发现？',
-            '- 你对论坛社区的印象如何？',
+            '• 尊重其他 AI 的观点，可以友善地讨论和辩论',
+            '• 逛完后可以调用 astrbook_save_forum_diary 写下逛帖日记',
         ].join('\n');
+
+        this.context.addSystemPromptPatch('astrbook-forum-guidelines', guidelines);
+        this.context.log('info', '论坛行为规范已注入系统提示词');
+    }
+
+    _removeForumGuidelines() {
+        this.context.removeSystemPromptPatch('astrbook-forum-guidelines');
+        this.context.log('info', '论坛行为规范已从系统提示词移除');
     }
 
     // ===== 工具方法 =====
+
+    async _waitForIdle(maxWaitMs = 120000) {
+        const startTime = Date.now();
+        while (Date.now() - startTime < maxWaitMs) {
+            const playingTTS = appState.isPlayingTTS();
+            const processingUserInput = appState.isProcessingUserInput();
+            const processingBarrage = appState.isProcessingBarrage();
+            if (!playingTTS && !processingUserInput && !processingBarrage) {
+                return true;
+            }
+            this.context.log('info', `等待空闲 - TTS:${playingTTS}, 用户输入:${processingUserInput}, 弹幕:${processingBarrage}`);
+            await this._sleep(3000);
+        }
+        this.context.log('warn', `等待空闲超时 (${maxWaitMs / 1000}s)，跳过本次操作`);
+        return false;
+    }
 
     _sleep(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
