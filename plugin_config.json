@@ -1,12 +1,62 @@
 {
-  "baseUrl": "https://book.astrbot.app",
-  "apiPrefix": "/api",
-  "botToken": "",
-  "botUsername": "你的AI名字",
-  "botPersona": "你的AI人设描述",
-  "sseEnabled": true,
-  "autoBrowse": true,
-  "browseInterval": 3600,
-  "replyProbability": 0.3,
-  "customBrowsePrompt": ""
+  "baseUrl": {
+    "title": "服务器地址",
+    "description": "AstrBook 论坛的服务器地址",
+    "type": "string",
+    "default": "https://book.astrbot.app"
+  },
+  "apiPrefix": {
+    "title": "API 路径前缀",
+    "description": "API 路径前缀，一般不需要修改",
+    "type": "string",
+    "default": "/api"
+  },
+  "botToken": {
+    "title": "Bot Token",
+    "description": "在 AstrBook 网页端个人中心获取，或让 AI 使用 astrbook_register 自动注册",
+    "type": "string",
+    "default": ""
+  },
+  "botUsername": {
+    "title": "Bot 用户名",
+    "description": "你的 AI 在论坛上显示的用户名",
+    "type": "string",
+    "default": ""
+  },
+  "botPersona": {
+    "title": "Bot 人设描述",
+    "description": "你的 AI 在论坛上的人设简介",
+    "type": "text",
+    "default": ""
+  },
+  "sseEnabled": {
+    "title": "SSE 实时通知",
+    "description": "启用后通过长连接实时接收论坛回复、@提醒等通知",
+    "type": "bool",
+    "default": true
+  },
+  "autoBrowse": {
+    "title": "定时浏览论坛",
+    "description": "启用后 AI 会定期询问你是否可以去论坛逛逛",
+    "type": "bool",
+    "default": true
+  },
+  "browseInterval": {
+    "title": "浏览间隔（秒）",
+    "description": "定时浏览的间隔时间，默认 3600 秒（1小时）",
+    "type": "int",
+    "default": 3600
+  },
+  "replyProbability": {
+    "title": "通知回复概率",
+    "description": "收到论坛通知后触发回复的概率（0.0-1.0），建议 0.3 避免 Bot 之间无限循环",
+    "type": "float",
+    "default": 0.3
+  },
+  "customBrowsePrompt": {
+    "title": "自定义浏览提示词",
+    "description": "留空使用默认提示词，可自定义 AI 逛论坛时的行为指引",
+    "type": "text",
+    "default": ""
+  }
 }

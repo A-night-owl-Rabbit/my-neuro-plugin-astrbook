@@ -550,10 +550,8 @@ class AstrbookForumPlugin extends Plugin {
 
     _loadConfig() {
         try {
-            if (fs.existsSync(this._configPath)) {
-                const config = JSON.parse(fs.readFileSync(this._configPath, 'utf-8'));
-                Object.assign(this._config, config);
-            }
+            const cfg = this.context.getPluginConfig();
+            Object.assign(this._config, cfg);
         } catch (error) {
             this.context.log('warn', `加载配置失败: ${error.message}`);
         }
@@ -561,7 +559,19 @@ class AstrbookForumPlugin extends Plugin {
 
     _saveConfig() {
         try {
-            fs.writeFileSync(this._configPath, JSON.stringify(this._config, null, 2), 'utf-8');
+            const raw = fs.existsSync(this._configPath)
+                ? JSON.parse(fs.readFileSync(this._configPath, 'utf-8'))
+                : {};
+
+            for (const [key, val] of Object.entries(this._config)) {
+                if (raw[key] && typeof raw[key] === 'object' && 'type' in raw[key]) {
+                    raw[key].value = val;
+                } else {
+                    raw[key] = val;
+                }
+            }
+
+            fs.writeFileSync(this._configPath, JSON.stringify(raw, null, 2), 'utf-8');
         } catch (error) {
             this.context.log('warn', `保存配置失败: ${error.message}`);
         }
