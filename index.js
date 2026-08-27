@@ -391,6 +391,11 @@ class AstrbookForumPlugin extends Plugin {
         this._sseRunning = false;
         this._botUserId = null;
         this._browseTimer = null;
+        this._browseFirstTimeout = null;   // B033: 首次浏览一次性定时器句柄
+        this._stopped = false;             // B033: 插件是否已停止
+        this._sseConnected = false;        // B036: 本轮 SSE 是否真正连接成功
+        this._sseToken = 0;                // SSE 循环代际，重启时使旧循环退出
+        this._proactiveInFlight = false;   // B039: 主动流程串行化标记
     }
 
     // ===== 生命周期 =====
@@ -400,6 +405,7 @@ class AstrbookForumPlugin extends Plugin {
     }
 
     async onStart() {
+        this._stopped = false;
         const token = this._config.botToken;
         const status = token ? '已配置' : '未配置';
         this.context.log('info', `AstrBook 论坛插件已启动 (Token: ${status})`);
@@ -415,16 +421,47 @@ class AstrbookForumPlugin extends Plugin {
     }
 
     async onStop() {
+        this._stopped = true;
+        this._stopProactiveServices();
+        this.context.log('info', 'AstrBook 论坛插件已停止');
+    }
+
+    async onConfigChanged(newPluginConfig, oldPluginConfig, fullConfig) {
+        // B060: 运行时配置变更后重新加载配置，并按新值重启/停止 SSE 与定时浏览
+        this._loadConfig();
+        this._stopProactiveServices();
+        if (!this._stopped) {
+            this._startProactiveServices();
+        }
+        this.context.log('info', 'AstrBook 论坛配置已热重载');
+    }
+
+    // 启动主动服务（SSE / 定时浏览），幂等；供运行时注册、配置、热重载复用
+    _startProactiveServices() {
+        if (!this._config.botToken) return;
+        if (this._config.sseEnabled && !this._sseRunning) {
+            this._startSSE();
+        }
+        if (this._config.autoBrowse && !this._browseTimer) {
+            this._startAutoBrowse();
+        }
+    }
+
+    // 停止主动服务（SSE / 定时浏览），清理所有定时器
+    _stopProactiveServices() {
         this._sseRunning = false;
         if (this._sseController) {
             this._sseController.abort();
             this._sseController = null;
         }
+        if (this._browseFirstTimeout) {
+            clearTimeout(this._browseFirstTimeout);
+            this._browseFirstTimeout = null;
+        }
         if (this._browseTimer) {
             clearInterval(this._browseTimer);
             this._browseTimer = null;
         }
-        this.context.log('info', 'AstrBook 论坛插件已停止');
     }
 
     // ===== 工具注册 =====
@@ -438,12 +475,12 @@ class AstrbookForumPlugin extends Plugin {
             case "astrbook_browse_threads": {
                 const result = await this._browseThreads(params.page || 1, params.page_size || 10, params.category || null);
                 const catInfo = params.category ? `（分类: ${params.category}）` : '';
-                this._autoLogActivity('browsed', `浏览了论坛帖子列表第 ${params.page || 1} 页${catInfo}`);
+                if (!result.includes('失败')) this._autoLogActivity('browsed', `浏览了论坛帖子列表第 ${params.page || 1} 页${catInfo}`);
                 return result;
             }
             case "astrbook_view_thread": {
                 const result = await this._viewThread(params.thread_id, params.page || 1, params.page_size || 10);
-                this._autoLogActivity('browsed', `阅读了帖子 #${params.thread_id}`);
+                if (!result.includes('失败')) this._autoLogActivity('browsed', `阅读了帖子 #${params.thread_id}`);
                 return result;
             }
             case "astrbook_create_thread": {
@@ -473,17 +510,17 @@ class AstrbookForumPlugin extends Plugin {
             }
             case "astrbook_view_sub_replies": {
                 const result = await this._viewSubReplies(params.reply_id, params.page || 1, params.page_size || 10);
-                this._autoLogActivity('browsed', `查看了楼层 #${params.reply_id} 的楼中楼`);
+                if (!result.includes('失败')) this._autoLogActivity('browsed', `查看了楼层 #${params.reply_id} 的楼中楼`);
                 return result;
             }
             case "astrbook_check_notifications": {
                 const result = await this._checkNotifications();
-                this._autoLogActivity('browsed', `检查了论坛通知`);
+                if (!result.includes('失败')) this._autoLogActivity('browsed', `检查了论坛通知`);
                 return result;
             }
             case "astrbook_get_notifications": {
                 const result = await this._getNotifications(params.unread_only !== false);
-                this._autoLogActivity('browsed', `查看了论坛通知列表`);
+                if (!result.includes('失败')) this._autoLogActivity('browsed', `查看了论坛通知列表`);
                 return result;
             }
             case "astrbook_mark_notifications_read":
@@ -492,7 +529,7 @@ class AstrbookForumPlugin extends Plugin {
                 return await this._getMyProfile();
             case "astrbook_search_threads": {
                 const result = await this._searchThreads(params.keyword, params.page || 1, params.category || null);
-                this._autoLogActivity('browsed', `搜索了论坛帖子，关键词: ${params.keyword}`);
+                if (!result.includes('失败')) this._autoLogActivity('browsed', `搜索了论坛帖子，关键词: ${params.keyword}`);
                 return result;
             }
             case "astrbook_delete_thread": {
@@ -607,7 +644,10 @@ class AstrbookForumPlugin extends Plugin {
         const options = {
             method,
             headers,
-            signal: AbortSignal.timeout(this._config.requestTimeout || 40000)
+            signal: AbortSignal.timeout((() => {
+                const n = Number(this._config.requestTimeout);
+                return Number.isFinite(n) && n > 0 ? n : 40000;
+            })())
         };
 
         if (body && (method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE')) {
@@ -637,7 +677,30 @@ class AstrbookForumPlugin extends Plugin {
     }
 
     _containsUnuploadedImage(content) {
-        return IMAGE_MARKDOWN_REGEX.test(content);
+        // B030: 仅拦截非论坛图床（未托管）的图片；论坛图床/同源链接放行
+        if (!content || !IMAGE_MARKDOWN_REGEX.test(content)) return false;
+        const regex = /!\[.*?\]\(\s*([^)\s]+)/g;
+        let match;
+        while ((match = regex.exec(content)) !== null) {
+            if (!this._isImagebedUrl(match[1])) return true;
+        }
+        return false;
+    }
+
+    _isImagebedUrl(url) {
+        if (!url) return false;
+        const u = String(url).trim();
+        if (!u) return false;
+        if (u.startsWith('/')) return true;   // 相对路径，同源
+        try {
+            const baseHost = new URL(this._config.baseUrl).host;
+            const targetHost = new URL(u, this._config.baseUrl).host;
+            if (targetHost === baseHost) return true;
+            const suffix = baseHost.split('.').slice(-2).join('.');
+            return targetHost === suffix || targetHost.endsWith('.' + suffix);
+        } catch {
+            return false;
+        }
     }
 
     // ===== 论坛功能 =====
@@ -842,6 +905,7 @@ class AstrbookForumPlugin extends Plugin {
             this._config.botUsername = registerUsername;
             this._config.botPersona = registerPersona;
             this._saveConfig();
+            this._startProactiveServices();   // B031: 运行时注册后立即启动 SSE / 定时浏览
         }
         return `注册成功！\n用户名: ${registerUsername}\nToken: ${this._config.botToken ? '已保存' : '请手动配置'}\n\n本小姐现在可以在 Astrbook 论坛上发言了！`;
     }
@@ -1102,7 +1166,16 @@ class AstrbookForumPlugin extends Plugin {
             const base64Data = imageData.toString('base64');
             const mimeType = contentType.split(';')[0].trim();
 
-            return `[图片已加载] 格式: ${mimeType}, 大小: ${(imageData.length / 1024).toFixed(1)}KB\ndata:${mimeType};base64,${base64Data.substring(0, 100)}... (已传递给视觉模型)`;
+            // B035: 真正把图片交给具备视觉能力的模型识别并返回真实结果；失败则如实说明，不再伪造已看过图片的假结论
+            try {
+                const description = await this.context.callLLM([
+                    { type: 'text', text: '请用中文简要描述这张图片的内容；如果你无法查看图片，请直接说明看不到。' },
+                    { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Data}`, detail: 'low' } }
+                ], { timeout_ms: 30000 });
+                return `[图片内容] 格式: ${mimeType}, 大小: ${(imageData.length / 1024).toFixed(1)}KB\n${description}`;
+            } catch (e) {
+                return `[图片已下载] 格式: ${mimeType}, 大小: ${(imageData.length / 1024).toFixed(1)}KB。当前无法调用视觉模型识别图片内容（${e.message}），请根据帖子文字信息判断，不要臆测图片内容。`;
+            }
         } catch (error) {
             return `查看图片出错: ${error.message}`;
         }
@@ -1112,10 +1185,7 @@ class AstrbookForumPlugin extends Plugin {
 
     _autoLogActivity(memoryType, content) {
         try {
-            let activities = [];
-            if (fs.existsSync(this._activityPath)) {
-                activities = JSON.parse(fs.readFileSync(this._activityPath, 'utf-8'));
-            }
+            let activities = this._readStateFile(this._activityPath);
             activities.push({
                 memory_type: memoryType,
                 content: content,
@@ -1123,20 +1193,60 @@ class AstrbookForumPlugin extends Plugin {
                 metadata: { is_auto: true }
             });
             if (activities.length > 50) activities = activities.slice(-50);
-            fs.writeFileSync(this._activityPath, JSON.stringify(activities, null, 2), 'utf-8');
+            this._writeStateFile(this._activityPath, activities);
         } catch (e) {
             // 静默失败，不影响主流程
         }
+    }
+
+    // B032: 读取状态文件；解析失败时非覆盖式备份损坏文件并重置为 []，保证功能可恢复
+    _readStateFile(filePath) {
+        if (!fs.existsSync(filePath)) return [];
+        try {
+            const parsed = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+            return Array.isArray(parsed) ? parsed : [];
+        } catch (e) {
+            this._backupCorruptFile(filePath);
+            return [];
+        }
+    }
+
+    _backupCorruptFile(filePath) {
+        try {
+            let backup = `${filePath}.corrupt`;
+            let i = 1;
+            while (fs.existsSync(backup)) {
+                backup = `${filePath}.corrupt.${i++}`;
+            }
+            fs.renameSync(filePath, backup);
+            this.context.log('warn', `状态文件损坏，已备份为 ${path.basename(backup)} 并重置`);
+        } catch (e) {
+            // 备份失败也不阻塞主流程
+        }
+    }
+
+    // B032: 原子写入（临时文件 + rename），避免中途崩溃截断文件
+    _writeStateFile(filePath, data) {
+        const tmp = `${filePath}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(data, null, 2), 'utf-8');
+        fs.renameSync(tmp, filePath);
+    }
+
+    // B038: 以本地时区渲染日期，避免 UTC substring 造成凌晨时段错位
+    _localDate(ts) {
+        const d = ts ? new Date(ts) : new Date();
+        if (isNaN(d.getTime())) return String(ts || '').substring(0, 10);
+        const y = d.getFullYear();
+        const m = String(d.getMonth() + 1).padStart(2, '0');
+        const day = String(d.getDate()).padStart(2, '0');
+        return `${y}-${m}-${day}`;
     }
 
     _saveForumDiary(diary) {
         if (!diary || diary.trim().length < 10) return "日记内容太短了，请写下更多想法和感受。";
 
         try {
-            let diaries = [];
-            if (fs.existsSync(this._diaryPath)) {
-                diaries = JSON.parse(fs.readFileSync(this._diaryPath, 'utf-8'));
-            }
+            let diaries = this._readStateFile(this._diaryPath);
             diaries.push({
                 memory_type: 'diary',
                 content: diary.trim(),
@@ -1144,7 +1254,7 @@ class AstrbookForumPlugin extends Plugin {
                 metadata: { is_agent_summary: true, char_count: diary.trim().length }
             });
             if (diaries.length > 50) diaries = diaries.slice(-50);
-            fs.writeFileSync(this._diaryPath, JSON.stringify(diaries, null, 2), 'utf-8');
+            this._writeStateFile(this._diaryPath, diaries);
             return "📔 日记已保存！下次在其他地方聊天时，可以回忆起这些经历。";
         } catch (error) {
             return `保存日记失败: ${error.message}`;
@@ -1153,15 +1263,8 @@ class AstrbookForumPlugin extends Plugin {
 
     _recallForumExperience(limit) {
         try {
-            let diaries = [];
-            let activities = [];
-
-            if (fs.existsSync(this._diaryPath)) {
-                diaries = JSON.parse(fs.readFileSync(this._diaryPath, 'utf-8'));
-            }
-            if (fs.existsSync(this._activityPath)) {
-                activities = JSON.parse(fs.readFileSync(this._activityPath, 'utf-8'));
-            }
+            let diaries = this._readStateFile(this._diaryPath);
+            let activities = this._readStateFile(this._activityPath);
 
             if (diaries.length === 0 && activities.length === 0) {
                 return "还没有逛过论坛，没有可以回忆的经历。";
@@ -1173,7 +1276,7 @@ class AstrbookForumPlugin extends Plugin {
                 lines.push('【我的日记】');
                 const recentDiaries = diaries.slice(-limit).reverse();
                 for (const item of recentDiaries) {
-                    const date = (item.timestamp || '').substring(0, 10);
+                    const date = this._localDate(item.timestamp);
                     lines.push(`  📝 [${date}] ${item.content}`);
                 }
                 lines.push('');
@@ -1190,7 +1293,7 @@ class AstrbookForumPlugin extends Plugin {
                 const recentActivities = activities.slice(-activityLimit).reverse();
                 for (const item of recentActivities) {
                     const emoji = emojis[item.memory_type] || '📌';
-                    const date = (item.timestamp || '').substring(0, 10);
+                    const date = this._localDate(item.timestamp);
                     lines.push(`  ${emoji} [${date}] ${item.content}`);
                 }
             }
@@ -1206,6 +1309,7 @@ class AstrbookForumPlugin extends Plugin {
         if (baseUrl) this._config.baseUrl = baseUrl;
         if (botToken) this._config.botToken = botToken;
         this._saveConfig();
+        this._startProactiveServices();   // B031: 运行时配置 Token 后立即启动 SSE / 定时浏览
         return `Astrbook 配置已更新：\n服务器地址: ${this._config.baseUrl}\nToken: ${this._config.botToken ? '已配置' : '未配置'}`;
     }
 
@@ -1213,15 +1317,16 @@ class AstrbookForumPlugin extends Plugin {
 
     _startSSE() {
         this._sseRunning = true;
-        this._sseLoop();
+        this._sseToken++;
+        this._sseLoop(this._sseToken);
     }
 
-    async _sseLoop() {
+    async _sseLoop(token) {
         let reconnectDelay = 5000;
         const maxDelay = 60000;
         let authFailures = 0;
 
-        while (this._sseRunning) {
+        while (this._sseRunning && token === this._sseToken) {
             try {
                 const authFailed = await this._sseConnect();
                 if (authFailed) {
@@ -1234,14 +1339,15 @@ class AstrbookForumPlugin extends Plugin {
                     }
                 } else {
                     authFailures = 0;
-                    reconnectDelay = 5000;
+                    // B036: 仅在真正连接成功后才重置退避；瞬时 HTTP 失败让退避继续递增
+                    if (this._sseConnected) reconnectDelay = 5000;
                 }
             } catch (e) {
                 this.context.log('warn', `SSE 连接异常: ${e.message}`);
                 authFailures = 0;
             }
 
-            if (!this._sseRunning) break;
+            if (!this._sseRunning || token !== this._sseToken) break;
             this.context.log('info', `SSE 将在 ${reconnectDelay / 1000}s 后重连...`);
             await this._sleep(reconnectDelay);
             reconnectDelay = Math.min(reconnectDelay * 2, maxDelay);
@@ -1254,6 +1360,7 @@ class AstrbookForumPlugin extends Plugin {
 
         const controller = new AbortController();
         this._sseController = controller;
+        this._sseConnected = false;   // B036: 标记本轮是否真正连接成功
 
         try {
             const response = await fetch(sseUrl, {
@@ -1271,6 +1378,7 @@ class AstrbookForumPlugin extends Plugin {
                 return false;
             }
 
+            this._sseConnected = true;
             this.context.log('info', 'SSE 连接成功');
             await this._parseSSEStream(response.body);
         } catch (e) {
@@ -1372,19 +1480,28 @@ class AstrbookForumPlugin extends Plugin {
         }
 
         this.context.log('info', `通知触发 LLM 回复 (概率=${(this._config.replyProbability * 100).toFixed(0)}%)，等待空闲...`);
-        const idle = await this._waitForIdle();
-        if (!idle) return;
-
-        const prompt = `你注意到论坛那边有动静：${summary}。跟主人提一下这件事吧，想去看看的话等主人同意了再去。`;
-
-        this._injectForumGuidelines();
+        if (this._proactiveInFlight) {
+            this.context.log('info', '已有主动流程进行中，跳过本次通知');
+            return;
+        }
+        this._proactiveInFlight = true;
         try {
-            await this._markNotificationsRead();
-            await this.context.sendMessage(prompt);
-        } catch (e) {
-            this.context.log('warn', `发送通知到 LLM 失败: ${e.message}`);
+            const idle = await this._waitForIdle();
+            if (!idle) return;
+
+            const prompt = `你注意到论坛那边有动静：${summary}。跟主人提一下这件事吧，想去看看的话等主人同意了再去。`;
+
+            // B034: 不在通知到达时就 read-all，改为等主人同意并实际回复后再标记，避免后续 get_notifications 找不到通知
+            this._injectForumGuidelines();
+            try {
+                await this.context.sendMessage(prompt);
+            } catch (e) {
+                this.context.log('warn', `发送通知到 LLM 失败: ${e.message}`);
+            } finally {
+                this._removeForumGuidelines();
+            }
         } finally {
-            this._removeForumGuidelines();
+            this._proactiveInFlight = false;
         }
     }
 
@@ -1414,28 +1531,42 @@ class AstrbookForumPlugin extends Plugin {
         }
 
         this.context.log('info', '私聊触发 LLM 回复，等待空闲...');
-        const idle = await this._waitForIdle();
-        if (!idle) return;
-
-        const prompt = `你收到了论坛上 ${senderName} 发来的私聊消息："${content.substring(0, 100)}"。跟主人说一下吧，想去回复的话等主人同意了再去。`;
-
-        this._injectForumGuidelines();
+        if (this._proactiveInFlight) {
+            this.context.log('info', '已有主动流程进行中，跳过本次私聊');
+            return;
+        }
+        this._proactiveInFlight = true;
         try {
-            await this.context.sendMessage(prompt);
-        } catch (e) {
-            this.context.log('warn', `发送私聊到 LLM 失败: ${e.message}`);
+            const idle = await this._waitForIdle();
+            if (!idle) return;
+
+            const prompt = `你收到了论坛上 ${senderName} 发来的私聊消息："${content.substring(0, 100)}"。跟主人说一下吧，想去回复的话等主人同意了再去。`;
+
+            this._injectForumGuidelines();
+            try {
+                await this.context.sendMessage(prompt);
+            } catch (e) {
+                this.context.log('warn', `发送私聊到 LLM 失败: ${e.message}`);
+            } finally {
+                this._removeForumGuidelines();
+            }
         } finally {
-            this._removeForumGuidelines();
+            this._proactiveInFlight = false;
         }
     }
 
     // ===== 定时浏览 =====
 
     _startAutoBrowse() {
-        const intervalMs = (this._config.browseInterval || 3600) * 1000;
-        this.context.log('info', `定时浏览已启用，间隔 ${this._config.browseInterval || 3600} 秒`);
+        const rawBI = Number(this._config.browseInterval);
+        const intervalSec = Number.isFinite(rawBI) && rawBI > 0 ? rawBI : 3600;
+        const intervalMs = intervalSec * 1000;
+        this.context.log('info', `定时浏览已启用，间隔 ${intervalSec} 秒`);
 
-        setTimeout(() => {
+        // B033: 保存一次性定时器句柄并在 onStop 清理；已停止时不再浏览
+        this._browseFirstTimeout = setTimeout(() => {
+            this._browseFirstTimeout = null;
+            if (this._stopped) return;
             if (!this._sseRunning && !this._config.sseEnabled) return;
             this._doBrowse();
         }, 60000);
@@ -1446,20 +1577,29 @@ class AstrbookForumPlugin extends Plugin {
     }
 
     async _doBrowse() {
-        this.context.log('info', '定时浏览论坛：等待 TTS/输入空闲...');
-        const idle = await this._waitForIdle();
-        if (!idle) return;
-
-        this.context.log('info', '请求主人许可浏览论坛...');
-        const prompt = this._formatBrowseAskPrompt();
-
-        this._injectForumGuidelines();
+        if (this._proactiveInFlight) {
+            this.context.log('info', '已有主动流程进行中，跳过本次定时浏览');
+            return;
+        }
+        this._proactiveInFlight = true;
         try {
-            await this.context.sendMessage(prompt);
-        } catch (e) {
-            this.context.log('warn', `定时浏览发送失败: ${e.message}`);
+            this.context.log('info', '定时浏览论坛：等待 TTS/输入空闲...');
+            const idle = await this._waitForIdle();
+            if (!idle) return;
+
+            this.context.log('info', '请求主人许可浏览论坛...');
+            const prompt = this._formatBrowseAskPrompt();
+
+            this._injectForumGuidelines();
+            try {
+                await this.context.sendMessage(prompt);
+            } catch (e) {
+                this.context.log('warn', `定时浏览发送失败: ${e.message}`);
+            } finally {
+                this._removeForumGuidelines();
+            }
         } finally {
-            this._removeForumGuidelines();
+            this._proactiveInFlight = false;
         }
     }
 
